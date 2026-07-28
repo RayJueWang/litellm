@@ -838,7 +838,7 @@ class TestUpdateModel:
             ),
             patch(
                 "litellm.proxy.management_endpoints.model_management_endpoints.clear_cache",
-                new=AsyncMock(return_value=None),
+                new=AsyncMock(return_value=True),
             ) as mock_clear_cache,
         ):
             await update_model(
@@ -3057,7 +3057,7 @@ class TestPatchModelBlockedAuthGate:
             ),
             patch(
                 "litellm.proxy.management_endpoints.model_management_endpoints.clear_cache",
-                new=AsyncMock(return_value=None),
+                new=AsyncMock(return_value=True),
             ),
         ):
             result = await patch_model(
@@ -3067,3 +3067,72 @@ class TestPatchModelBlockedAuthGate:
             )
             assert result is updated_row
             mock_prisma.db.litellm_proxymodeltable.update.assert_awaited_once()
+
+
+class TestWriteSurfacesReloadDrop:
+    """A model-write endpoint may report success only if every row it wrote is, after the
+    reload it triggered, live in this pod's router or deliberately environment-inactive."""
+
+    def test_written_model_ids_not_live_matrix(self, monkeypatch):
+        import litellm
+        from litellm.proxy.management_endpoints.model_management_endpoints import (
+            written_model_ids_not_live,
+        )
+
+        live_router = litellm.Router(
+            model_list=[
+                {
+                    "model_name": "gpt-4o",
+                    "litellm_params": {"model": "gpt-4o"},
+                    "model_info": {"id": "m-live", "db_model": True},
+                }
+            ]
+        )
+        monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", live_router)
+        monkeypatch.setenv("LITELLM_ENVIRONMENT", "development")
+
+        written = [
+            ("m-live", {"id": "m-live"}),
+            ("m-gone", {"id": "m-gone"}),
+            ("m-env", {"id": "m-env", "supported_environments": ["production"]}),
+            ("m-env-misconfigured", {"id": "m-env-misconfigured", "supported_environments": ["bogus"]}),
+        ]
+        assert written_model_ids_not_live(written) == ("m-gone", "m-env-misconfigured")
+
+        monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
+        assert written_model_ids_not_live([("m-live", None)]) == ("m-live",)
+
+    def test_raise_if_write_dropped_on_reload_contract(self, monkeypatch):
+        import litellm
+        from litellm.proxy._types import ProxyException
+        from litellm.proxy.management_endpoints.model_management_endpoints import (
+            raise_if_write_dropped_on_reload,
+        )
+
+        live_router = litellm.Router(
+            model_list=[
+                {
+                    "model_name": "gpt-4o",
+                    "litellm_params": {"model": "gpt-4o"},
+                    "model_info": {"id": "m-live", "db_model": True},
+                }
+            ]
+        )
+        monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", live_router)
+
+        assert (
+            raise_if_write_dropped_on_reload(
+                reload_succeeded=True, written_models=[("m-live", None)], action="update"
+            )
+            is None
+        )
+
+        with pytest.raises(ProxyException, match="failed to reload"):
+            raise_if_write_dropped_on_reload(
+                reload_succeeded=False, written_models=[("m-live", None)], action="update"
+            )
+
+        with pytest.raises(ProxyException, match="m-gone"):
+            raise_if_write_dropped_on_reload(
+                reload_succeeded=True, written_models=[("m-gone", None)], action="update"
+            )
